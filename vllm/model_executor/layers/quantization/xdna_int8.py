@@ -52,6 +52,13 @@ _QUANT = torch.ops._C.dynamic_scaled_int8_quant
 _ONEDNN_MM = torch.ops._C.onednn_scaled_mm
 
 USE_NPU = os.environ.get("XDNA_VLLM_NPU", "1") == "1"
+# Splits use the NPU while this holds; set_npu_enabled flips it at run time
+# (an A/B of the same process, weights and all).
+NPU_ENABLED = [True]
+
+
+def set_npu_enabled(on: bool) -> None:
+    NPU_ENABLED[0] = bool(on)
 NPU_MIN_ROWS = int(os.environ.get("XDNA_VLLM_NPU_MIN_ROWS", "1024"))  # fewer rows: CPU only
 # The linears worth an NPU copy (each costs its int8 size again in host
 # memory): all but the per-layer-input ones, whose N or K is 256.
@@ -60,6 +67,9 @@ NPU_LAYERS = re.compile(os.environ.get(
 _SKIP = ("vision", "audio", "embed_vision", "embed_audio")  # towers stay bf16
 
 TRACE = os.environ.get("XDNA_VLLM_TRACE", "0") == "1"  # one stderr line per call of >= 256 rows
+# Rows per NPU launch when the NPU's share has that many: fewer launches pay
+# the ~0.4 ms each costs whatever its size.
+LAUNCH_ROWS = int(os.environ.get("XDNA_VLLM_NPU_LAUNCH_ROWS", "1024"))
 _LAYERS = []  # Int8Linear by key; the custom op takes the key
 _TUNERS = {}  # (N, K, M // 512) -> _SplitTuner
 # Row counts to time the NPU split for at load; by default every multiple of
@@ -128,37 +138,104 @@ def _npu_thread_cpu():
     return free[-1] if free else None
 
 
+class _Job:
+    """One split call's NPU share: chunks launched in order, each dequantized by whoever gets it first.
+
+    The launch thread marks a chunk ready when its launch returns. The helper
+    thread dequantizes ready chunks one at a time while the caller is still on
+    its own oneDNN share; once the caller is done with that, it takes the
+    remaining ready chunks itself, with all its OpenMP threads.
+    """
+
+    READY, TAKEN, DONE = 1, 2, 3
+
+    def __init__(self, gemm, R, rows, sx, out):
+        self.gemm, self.sx, self.out = gemm, sx, out
+        self.chunks = [(r0, min(r0 + rows, R)) for r0 in range(0, R, rows)]
+        self.state = [0] * len(self.chunks)
+        self.cond = threading.Condition()
+        self.error = None
+
+    def _take(self):
+        """A ready chunk's index, now taken; None if there is none."""
+        for i, st in enumerate(self.state):
+            if st == self.READY:
+                self.state[i] = self.TAKEN
+                return i
+        return None
+
+    def _dequant(self, i, parallel):
+        r0, r1 = self.chunks[i]
+        self.gemm.dequant(r0, r1, self.sx[r0:r1], self.out[r0:r1], parallel)
+        with self.cond:
+            self.state[i] = self.DONE
+            self.cond.notify_all()
+
+    def finish(self):
+        """The caller's part: dequantize what is left, wait for the rest."""
+        while True:
+            with self.cond:
+                while True:
+                    if self.error is not None:
+                        raise RuntimeError("NPU GEMM failed") from self.error
+                    if all(st == self.DONE for st in self.state):
+                        return
+                    i = self._take()
+                    if i is not None:
+                        break
+                    self.cond.wait()
+            self._dequant(i, parallel=True)
+
+
 class _NpuWorker:
-    """The thread that launches NPU GEMMs, chunk by chunk, while the caller runs the CPU's share."""
+    """The NPU launch thread, and a helper thread that dequantizes finished chunks.
+
+    Both sit on a core no OpenMP thread uses (the launch thread mostly waits
+    on the NPU, so they share it).
+    """
 
     def __init__(self):
         self.jobs = queue.Queue()
-        threading.Thread(target=self._loop, daemon=True, name="xdna-npu").start()
-
-    def _loop(self):
+        self.ready = queue.Queue()
         cpu = _npu_thread_cpu()
+        threading.Thread(target=self._launch_loop, args=(cpu,), daemon=True, name="xdna-npu").start()
+        helper = min(_siblings(cpu)) if cpu is not None else None
+        threading.Thread(target=self._dequant_loop, args=(helper,), daemon=True, name="xdna-dequant").start()
+        if cpu is not None:
+            logger.info("xdna_int8: NPU launch thread on CPU %d, dequant helper on CPU %d", cpu, helper)
+
+    def _launch_loop(self, cpu):
         if cpu is not None:
             os.sched_setaffinity(0, {cpu})  # this thread only
-            logger.info("xdna_int8: NPU launch thread on CPU %d", cpu)
         npu_runtime.use_npu()
         while True:
-            gemm, R, done, times = self.jobs.get()
+            job = self.jobs.get()
             try:
-                for i, r0 in enumerate(range(0, R, npu.BLOCK_M)):
-                    t = time.perf_counter()
-                    gemm.launch_rows(r0, npu.BLOCK_M)
-                    times.append(time.perf_counter() - t)
-                    done[i].set()
+                for i, (r0, r1) in enumerate(job.chunks):
+                    job.gemm.launch_rows(r0, r1 - r0)
+                    with job.cond:
+                        job.state[i] = job.READY
+                        job.cond.notify_all()
+                    self.ready.put(job)
             except BaseException as e:  # hand the error to the caller
-                times.append(e)
-                for d in done:
-                    d.set()
+                with job.cond:
+                    job.error = e
+                    job.cond.notify_all()
 
-    def submit(self, gemm, R):
-        done = [threading.Event() for _ in range(R // npu.BLOCK_M)]
-        times = []
-        self.jobs.put((gemm, R, done, times))
-        return done, times
+    def _dequant_loop(self, cpu):
+        if cpu is not None:
+            os.sched_setaffinity(0, {cpu})
+        while True:
+            job = self.ready.get()
+            with job.cond:
+                i = job._take()
+            if i is not None:
+                job._dequant(i, parallel=False)
+
+    def submit(self, gemm, R, sx, out):
+        job = _Job(gemm, R, LAUNCH_ROWS if R >= LAUNCH_ROWS else npu.BLOCK_M, sx, out)
+        self.jobs.put(job)
+        return job
 
 
 _WORKER = None
@@ -260,7 +337,7 @@ class Int8Linear:
             logger.info("xdna_int8 [%d, %d] M=%d: NPU rows %d (%s)", self.N, self.K, M, t.pick(), t.summary())
 
     def npu_rows_for(self, M):
-        if self.npu is None or M < NPU_MIN_ROWS:
+        if self.npu is None or M < NPU_MIN_ROWS or not NPU_ENABLED[0]:
             return 0
         return self._tuner(M).pick()
 
@@ -286,15 +363,10 @@ class Int8Linear:
             return out, 0
         g = self.npu
         sx = g.quantize(x[:R])
-        done, times = _WORKER.submit(g, R)
+        job = _WORKER.submit(g, R, sx, out)
         if M > R:
             self.cpu(x[R:], out[R:])
-        for i, r0 in enumerate(range(0, R, npu.BLOCK_M)):
-            done[i].wait()
-            if times and isinstance(times[-1], BaseException):
-                raise RuntimeError(f"NPU GEMM failed in {self.name}") from times[-1]
-            r1 = r0 + npu.BLOCK_M
-            g.dequant(r0, r1, sx[r0:r1], out[r0:r1])
+        job.finish()
         self._tuner(M).record(R, time.perf_counter() - t0)
         STATS["npu_rows"] += R
         STATS["cpu_rows"] += M - R

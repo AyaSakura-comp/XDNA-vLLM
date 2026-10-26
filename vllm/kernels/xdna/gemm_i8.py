@@ -153,10 +153,10 @@ class NpuGemm:
         for r0 in range(0, -(-R // BLOCK_M) * BLOCK_M, BLOCK_M):
             self.launch_rows(r0)
 
-    def dequant(self, r0, r1, sx, out):
+    def dequant(self, r0, r1, sx, out, parallel=True):
         """out = bf16(results[r0:r1] * sx * sw), after evicting the rows' stale cache lines."""
         c = _staging["c"][r0 * self.n_pad: r1 * self.n_pad].view(r1 - r0, self.n_pad)
-        cpu_ops.invalidate_dequant(c, self.N, sx, self.sw, out)
+        cpu_ops.invalidate_dequant(c, self.N, sx, self.sw, out, parallel)
 
     def __call__(self, x):
         """bf16 x [M, K] -> bf16 [M, N] on the NPU alone (tests, benchmarks)."""

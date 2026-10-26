@@ -23,7 +23,8 @@ _SRC = r"""
 // evicting each block of c's rows from the caches (clflushopt + mfence), so
 // the loads see what the NPU wrote. c's rows must start on a cache line
 // (row bytes a multiple of 64), as do resident staging buffers.
-void invalidate_dequant(torch::Tensor c, int64_t n, torch::Tensor sx, torch::Tensor sw, torch::Tensor out) {
+void invalidate_dequant(torch::Tensor c, int64_t n, torch::Tensor sx, torch::Tensor sw, torch::Tensor out,
+                        bool parallel) {
   TORCH_CHECK(c.scalar_type() == torch::kInt32 && c.stride(1) == 1 && (c.stride(0) * 4) % 64 == 0);
   TORCH_CHECK(out.scalar_type() == torch::kBFloat16 && out.stride(1) == 1);
   TORCH_CHECK(sx.scalar_type() == torch::kFloat32 && sw.scalar_type() == torch::kFloat32 && sw.is_contiguous());
@@ -31,7 +32,7 @@ void invalidate_dequant(torch::Tensor c, int64_t n, torch::Tensor sx, torch::Ten
   const int32_t *C = c.data_ptr<int32_t>();
   const float *SX = sx.data_ptr<float>(), *SW = sw.data_ptr<float>();
   uint16_t *O = reinterpret_cast<uint16_t *>(out.data_ptr<at::BFloat16>());
-  at::parallel_for(0, R, 4, [&](int64_t r0, int64_t r1) {
+  auto rows = [&](int64_t r0, int64_t r1) {
     const char *p = reinterpret_cast<const char *>(C + r0 * ldc);
     const char *end = reinterpret_cast<const char *>(C + r1 * ldc);
     for (; p < end; p += 64) _mm_clflushopt(const_cast<char *>(p));
@@ -51,7 +52,13 @@ void invalidate_dequant(torch::Tensor c, int64_t n, torch::Tensor sx, torch::Ten
         orow[j] = b.x;
       }
     }
-  });
+  };
+  // Serial for a helper thread outside the OpenMP team: a parallel region
+  // opened from there would start a second team on the same cores.
+  if (parallel)
+    at::parallel_for(0, R, 4, rows);
+  else
+    for (int64_t r0 = 0; r0 < R; r0 += 8) rows(r0, std::min<int64_t>(r0 + 8, R));
 }
 
 // Evict t's bytes from the caches (before reading what the NPU wrote there).
@@ -66,7 +73,7 @@ void invalidate(torch::Tensor t) {
 }
 
 TORCH_LIBRARY(xdna_cpu, m) {
-  m.def("invalidate_dequant(Tensor c, int n, Tensor sx, Tensor sw, Tensor(a!) out) -> ()");
+  m.def("invalidate_dequant(Tensor c, int n, Tensor sx, Tensor sw, Tensor(a!) out, bool parallel) -> ()");
   m.def("invalidate(Tensor t) -> ()");
 }
 TORCH_LIBRARY_IMPL(xdna_cpu, CPU, m) {
@@ -92,9 +99,13 @@ def load():
             _loaded = True
 
 
-def invalidate_dequant(c, n, sx, sw, out):
-    """out[:, :n] = bf16(c[:, :n] * sx * sw[:n]), reading c only after evicting its lines."""
-    torch.ops.xdna_cpu.invalidate_dequant(c, n, sx, sw, out)
+def invalidate_dequant(c, n, sx, sw, out, parallel=True):
+    """out[:, :n] = bf16(c[:, :n] * sx * sw[:n]), reading c only after evicting its lines.
+
+    parallel=False runs it on the calling thread alone (for threads outside
+    torch's OpenMP team).
+    """
+    torch.ops.xdna_cpu.invalidate_dequant(c, n, sx, sw, out, parallel)
 
 
 def invalidate(t):
