@@ -69,13 +69,19 @@ def main():
                     v = 127 / (full - first)
                 res[(name, mode)].append(v)
         print(f"round {r + 1}/{rounds} done", flush=True)
-    print(f"\n{'':>22} {'CPU only':>12} {'CPU+NPU':>12} {'change':>8}")
+    # The two modes of a round ran back to back, so the median of the
+    # per-round ratios cancels load that drifts across rounds.
+    print(f"\n{'':>22} {'CPU only':>12} {'CPU+NPU':>12} {'paired change':>14} {'rounds NPU better':>18}")
     for name in tests:
-        c, n = statistics.median(res[(name, "cpu")]), statistics.median(res[(name, "npu")])
+        cs, ns = res[(name, "cpu")], res[(name, "npu")]
+        c, n = statistics.median(cs), statistics.median(ns)
+        ratio = statistics.median(b / a for a, b in zip(cs, ns))
         if name.startswith("decode"):
-            print(f"{name:>22} {c:9.1f} t/s {n:9.1f} t/s {100 * (n / c - 1):+7.1f}%")
+            better = sum(b > a for a, b in zip(cs, ns))
+            print(f"{name:>22} {c:9.1f} t/s {n:9.1f} t/s {100 * (ratio - 1):+13.1f}% {better:>11}/{len(cs)}")
         else:
-            print(f"{name:>22} {1e3 * c:9.0f} ms {1e3 * n:9.0f} ms {100 * (n / c - 1):+7.1f}%")
+            better = sum(b < a for a, b in zip(cs, ns))
+            print(f"{name:>22} {1e3 * c:9.0f} ms {1e3 * n:9.0f} ms {100 * (ratio - 1):+13.1f}% {better:>11}/{len(cs)}")
     print("samples:", {f"{k[0]}|{k[1]}": [round(x, 3) for x in v] for k, v in res.items()})
 
 

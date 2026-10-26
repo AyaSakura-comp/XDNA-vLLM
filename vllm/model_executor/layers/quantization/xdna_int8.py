@@ -155,6 +155,8 @@ class _Job:
         self.state = [0] * len(self.chunks)
         self.cond = threading.Condition()
         self.error = None
+        self.t_submit = time.perf_counter()
+        self.t_last = None  # when the last launch returned
 
     def _take(self):
         """A ready chunk's index, now taken; None if there is none."""
@@ -215,6 +217,8 @@ class _NpuWorker:
                     job.gemm.launch_rows(r0, r1 - r0)
                     with job.cond:
                         job.state[i] = job.READY
+                        if i == len(job.chunks) - 1:
+                            job.t_last = time.perf_counter()
                         job.cond.notify_all()
                     self.ready.put(job)
             except BaseException as e:  # hand the error to the caller
@@ -242,19 +246,28 @@ _WORKER = None
 
 
 class _SplitTuner:
-    """Picks the NPU's share of rows by timing whole calls: each candidate a few
-    times, then the fastest by median, re-trying the others now and then (the
-    machine's load changes). The CPU-only candidate (0) is always among them, so
-    the split is never kept if it does not pay for its quantize/dequantize."""
+    """Picks the NPU's share of rows for one (N, K, M // 512).
+
+    At load, every candidate (0, 512, ... rows) is timed a few times and the
+    fastest by median is the starting split. 0 (CPU only) is among them, so a
+    shape where the NPU does not pay for its quantize/dequantize stays on the
+    CPU. From then on the split follows the machine: after each call, if the
+    caller had to wait for the NPU's rows it gives the NPU 512 fewer, and if
+    the NPU's rows were ready well before the CPU's, 512 more. Load from other
+    processes (on the CPU, the DRAM, or the NPU itself) moves the balance a
+    timing made at load would not see.
+    """
 
     SAMPLES = 3
-    RETRY_EVERY = 64
+    PROBE_EVERY = 64  # calls, at a split of 0: try 512 rows again
 
     def __init__(self, candidates):
         self.times = {r: [] for r in candidates}
+        self.top = max(candidates)
         self.best = None
         self.calls = 0
         self.calibrated = False
+        self.lean = 0.0  # smoothed (NPU done - CPU done), seconds
 
     def exploring(self):
         return any(len(ts) < self.SAMPLES for ts in self.times.values())
@@ -267,18 +280,33 @@ class _SplitTuner:
         for r, ts in self.times.items():
             if len(ts) < self.SAMPLES:
                 return r
-        if self.best is None or self.calls % self.RETRY_EVERY == 0:
+        if self.best is None:
             med = {r: sorted(ts)[len(ts) // 2] for r, ts in self.times.items()}
             self.best = min(med, key=med.get)
-            if self.calls % self.RETRY_EVERY == 0:  # re-time the runner-up
-                return sorted(med, key=med.get)[min(1, len(med) - 1)]
+        if self.best == 0 and self.calibrated and self.calls % self.PROBE_EVERY == 0:
+            return min(512, self.top)
         return self.best
 
     def record(self, r, t):
-        if r in self.times:
-            ts = self.times[r]
-            ts.append(t)
-            del ts[: -self.SAMPLES * 2]  # recent samples only
+        if r in self.times and not self.calibrated:
+            self.times[r].append(t)
+
+    def balance(self, r, late, per_chunk):
+        """After a call with r NPU rows: late = when its NPU rows were all in, minus when the
+        CPU finished its own (s); per_chunk = the NPU's time per 512 rows (s)."""
+        if not self.calibrated or self.best is None:
+            return
+        if self.best == 0:  # a probe: keep it if the NPU's rows came back first
+            if r > 0 and late < 0:
+                self.best, self.lean = r, 0.0
+            return
+        if r != self.best:
+            return
+        self.lean = 0.7 * self.lean + 0.3 * late
+        if self.lean > 0.5 * per_chunk:
+            self.best, self.lean = self.best - 512, 0.0
+        elif self.lean < -1.5 * per_chunk and self.best + 512 <= self.top:
+            self.best, self.lean = self.best + 512, 0.0
 
 
 class Int8Linear:
@@ -366,8 +394,12 @@ class Int8Linear:
         job = _WORKER.submit(g, R, sx, out)
         if M > R:
             self.cpu(x[R:], out[R:])
+        t_cpu = time.perf_counter()
         job.finish()
-        self._tuner(M).record(R, time.perf_counter() - t0)
+        tuner = self._tuner(M)
+        tuner.record(R, time.perf_counter() - t0)
+        if job.t_last is not None:
+            tuner.balance(R, job.t_last - t_cpu, (job.t_last - job.t_submit) * npu.BLOCK_M / R)
         STATS["npu_rows"] += R
         STATS["cpu_rows"] += M - R
         return out, R

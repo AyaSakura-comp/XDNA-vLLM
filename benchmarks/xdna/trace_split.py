@@ -1,4 +1,4 @@
-"""Timeline of one split Int8Linear call: the main thread's steps and the NPU thread's launches.
+"""Timeline of one split Int8Linear call: the main thread, the NPU launch thread, the dequant helper.
 
 Runs a linear of a Gemma 4 E2B shape at M rows with R of them on the NPU,
 under the OMP binding vLLM's CPU worker uses, and writes the spans of the
@@ -30,42 +30,66 @@ def span(lane, phase, cat, t0, t1):
 
 
 _launch = npu.NpuGemm.launch_rows
+_cpu = q.Int8Linear.cpu
+_dq = q._Job._dequant
+_quant = npu.NpuGemm.quantize
 
 
 def traced_launch(self, r0, n=npu.BLOCK_M):
     t = time.perf_counter()
     _launch(self, r0, n)
     t1 = time.perf_counter()
-    span("NPU thread", f"launch rows {r0}-{r0 + n}", "submit", t, t1)
+    span("NPU launch thread", f"launch rows {r0}-{r0 + n}", "submit", t, t1)
     # The launcher's own timing of xrt::run start -> wait2 (autotune_time).
     run = float(open("data.txt").read()) / 1e6
     SPANS.append({"lane": "NPU", "phase": f"NPU run {r0}-{r0 + n}", "category": "io",
-                  "rel_start": t1 - run - T0[0], "duration_sec": run, "approx_start": True})
+                  "rel_start": t1 - run - T0[0], "duration_sec": run})
+
+
+def traced_cpu(self, x, out):
+    t = time.perf_counter()
+    _cpu(self, x, out)
+    span("main thread", f"oneDNN {x.shape[0]} rows", "plan", t, time.perf_counter())
+    return out
+
+
+def traced_dequant(self, i, parallel):
+    t = time.perf_counter()
+    _dq(self, i, parallel)
+    r0, r1 = self.chunks[i]
+    lane = "main thread" if parallel else "dequant helper"
+    span(lane, f"dequant {r0}-{r1}", "render", t, time.perf_counter())
+
+
+def traced_quant(self, x):
+    t = time.perf_counter()
+    sx = _quant(self, x)
+    span("main thread", "quantize NPU rows", "fill", t, time.perf_counter())
+    return sx
 
 
 npu.NpuGemm.launch_rows = traced_launch
+q.Int8Linear.cpu = traced_cpu
+q._Job._dequant = traced_dequant
+npu.NpuGemm.quantize = traced_quant
+
+
+class _FixedTuner:
+    def __init__(self, R):
+        self.R = R
+
+    def pick(self):
+        return self.R
+
+    def record(self, r, t):
+        pass
 
 
 def run(lin, x, R):
-    """Int8Linear._run with the main thread's steps timed (same calls, same order)."""
-    M = x.shape[0]
+    """One real Int8Linear call with R rows on the NPU; its spans, and its time."""
+    lin._tuner = lambda M: _FixedTuner(R)
     T0[0] = t = time.perf_counter()
-    out = torch.empty((M, lin.N), dtype=torch.bfloat16)
-    g = lin.npu
-    sx = g.quantize(x[:R])
-    t1 = time.perf_counter(); span("main thread", "quantize NPU rows", "fill", t, t1)
-    done, times = q._WORKER.submit(g, R)
-    lin.cpu(x[R:], out[R:])
-    t2 = time.perf_counter(); span("main thread", f"oneDNN {M - R} rows", "plan", t1, t2)
-    for i, r0 in enumerate(range(0, R, npu.BLOCK_M)):
-        ta = time.perf_counter()
-        done[i].wait()
-        tb = time.perf_counter()
-        if tb - ta > 1e-4:
-            span("main thread", f"wait NPU {i}", "settle", ta, tb)
-        r1 = r0 + npu.BLOCK_M
-        g.dequant(r0, r1, sx[r0:r1], out[r0:r1])
-        span("main thread", f"dequant {r0}-{r1}", "render", tb, time.perf_counter())
+    lin._run(x)
     return time.perf_counter() - t
 
 
@@ -86,10 +110,10 @@ def main():
     x = torch.randn(M, K).to(torch.bfloat16)
     out = torch.empty(M, N, dtype=torch.bfloat16)
     for _ in range(3):
-        lin.cpu(x, out)
+        _cpu(lin, x, out)
     t = time.perf_counter()
     for _ in range(5):
-        lin.cpu(x, out)
+        _cpu(lin, x, out)
     t_cpu = (time.perf_counter() - t) / 5
     calls = []
     for _ in range(9):
