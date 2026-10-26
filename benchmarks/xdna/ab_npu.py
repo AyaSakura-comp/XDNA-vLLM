@@ -26,9 +26,14 @@ def prompts(tok, B, n, salt):
                                          add_generation_prompt=True, return_dict=True)["input_ids"]) for i in range(B)]
 
 
-def set_npu(worker, on):
+MODES = {"cpu": (False, None), "npu": (True, None)}
+if os.environ.get("AB_FIXED_SHARE"):  # also a fixed split, tuner bypassed
+    MODES["npu-fixed"] = (True, float(os.environ["AB_FIXED_SHARE"]))
+
+
+def set_npu(worker, on, share=None):
     from vllm.model_executor.layers.quantization import xdna_int8
-    xdna_int8.set_npu_enabled(on)
+    xdna_int8.set_npu_enabled(on, share)
 
 
 def main():
@@ -54,15 +59,16 @@ def main():
         "decode B=1": lambda s: (gen(prompts(tok, 1, 190, s), 128), gen(prompts(tok, 1, 190, s + "x"), 1)),
         "decode B=4": lambda s: (gen(prompts(tok, 4, 190, s), 128), gen(prompts(tok, 4, 190, s + "x"), 1)),
     }
-    res = {(t, m): [] for t in tests for m in ("cpu", "npu")}
-    for name, fn in tests.items():  # warm-up, both modes
-        for on in (True, False):
-            llm.collective_rpc(set_npu, args=(on,))
-            fn(f"warm{name}{on}")
+    res = {(t, m): [] for t in tests for m in MODES}
+    for name, fn in tests.items():  # warm-up, every mode
+        for mode, args in MODES.items():
+            llm.collective_rpc(set_npu, args=args)
+            fn(f"warm{name}{mode}")
+    order = list(MODES)
     for r in range(rounds):
         for name, fn in tests.items():
-            for mode in (("npu", "cpu") if r % 2 == 0 else ("cpu", "npu")):
-                llm.collective_rpc(set_npu, args=(mode == "npu",))
+            for mode in (order if r % 2 == 0 else order[::-1]):
+                llm.collective_rpc(set_npu, args=MODES[mode])
                 v = fn(f"r{r}{name}{mode}")
                 if name.startswith("decode"):  # tokens/s per request over the 127 decode steps
                     full, first = v
@@ -72,16 +78,20 @@ def main():
     # The two modes of a round ran back to back, so the median of the
     # per-round ratios cancels load that drifts across rounds.
     print(f"\n{'':>22} {'CPU only':>12} {'CPU+NPU':>12} {'paired change':>14} {'rounds NPU better':>18}")
-    for name in tests:
-        cs, ns = res[(name, "cpu")], res[(name, "npu")]
-        c, n = statistics.median(cs), statistics.median(ns)
-        ratio = statistics.median(b / a for a, b in zip(cs, ns))
-        if name.startswith("decode"):
-            better = sum(b > a for a, b in zip(cs, ns))
-            print(f"{name:>22} {c:9.1f} t/s {n:9.1f} t/s {100 * (ratio - 1):+13.1f}% {better:>11}/{len(cs)}")
-        else:
-            better = sum(b < a for a, b in zip(cs, ns))
-            print(f"{name:>22} {1e3 * c:9.0f} ms {1e3 * n:9.0f} ms {100 * (ratio - 1):+13.1f}% {better:>11}/{len(cs)}")
+    for mode in MODES:
+        if mode == "cpu":
+            continue
+        print(f"-- {mode}")
+        for name in tests:
+            cs, ns = res[(name, "cpu")], res[(name, mode)]
+            c, n = statistics.median(cs), statistics.median(ns)
+            ratio = statistics.median(b / a for a, b in zip(cs, ns))
+            if name.startswith("decode"):
+                better = sum(b > a for a, b in zip(cs, ns))
+                print(f"{name:>22} {c:9.1f} t/s {n:9.1f} t/s {100 * (ratio - 1):+13.1f}% {better:>11}/{len(cs)}")
+            else:
+                better = sum(b < a for a, b in zip(cs, ns))
+                print(f"{name:>22} {1e3 * c:9.0f} ms {1e3 * n:9.0f} ms {100 * (ratio - 1):+13.1f}% {better:>11}/{len(cs)}")
     print("samples:", {f"{k[0]}|{k[1]}": [round(x, 3) for x in v] for k, v in res.items()})
 
 

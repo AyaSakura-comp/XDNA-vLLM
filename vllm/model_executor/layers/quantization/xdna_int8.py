@@ -55,10 +55,12 @@ USE_NPU = os.environ.get("XDNA_VLLM_NPU", "1") == "1"
 # Splits use the NPU while this holds; set_npu_enabled flips it at run time
 # (an A/B of the same process, weights and all).
 NPU_ENABLED = [True]
+FIXED_SHARE = [None]  # when set, the NPU's share of every split (a fraction), tuner bypassed
 
 
-def set_npu_enabled(on: bool) -> None:
+def set_npu_enabled(on: bool, fixed_share: float | None = None) -> None:
     NPU_ENABLED[0] = bool(on)
+    FIXED_SHARE[0] = fixed_share
 NPU_MIN_ROWS = int(os.environ.get("XDNA_VLLM_NPU_MIN_ROWS", "1024"))  # fewer rows: CPU only
 # The linears worth an NPU copy (each costs its int8 size again in host
 # memory): all but the per-layer-input ones, whose N or K is 256.
@@ -67,9 +69,12 @@ NPU_LAYERS = re.compile(os.environ.get(
 _SKIP = ("vision", "audio", "embed_vision", "embed_audio")  # towers stay bf16
 
 TRACE = os.environ.get("XDNA_VLLM_TRACE", "0") == "1"  # one stderr line per call of >= 256 rows
-# Rows per NPU launch when the NPU's share has that many: fewer launches pay
-# the ~0.4 ms each costs whatever its size.
-LAUNCH_ROWS = int(os.environ.get("XDNA_VLLM_NPU_LAUNCH_ROWS", "1024"))
+# Rows per NPU launch. Each grid is its own compiled kernel and so its own NPU
+# hardware context: launching both 512- and 1024-row grids doubles a model's
+# ~9 contexts past what the backend keeps, and every evicted one costs ~35 ms
+# to reopen (measured: 3-11 reopens a prefill). Bigger launches measured no
+# faster anyway.
+LAUNCH_ROWS = int(os.environ.get("XDNA_VLLM_NPU_LAUNCH_ROWS", "512"))
 _LAYERS = []  # Int8Linear by key; the custom op takes the key
 _TUNERS = {}  # (N, K, M // 512) -> _SplitTuner
 # Row counts to time the NPU split for at load; by default every multiple of
@@ -77,7 +82,7 @@ _TUNERS = {}  # (N, K, M // 512) -> _SplitTuner
 # since the tuner keeps one split per M // 512 and a prefill's last chunk, or a
 # batch of prompts, can land in any of them.
 _CALIBRATE_ENV = os.environ.get("XDNA_VLLM_CALIBRATE_ROWS")
-STATS = {"npu_rows": 0, "cpu_rows": 0, "calls": 0}
+STATS = {"npu_rows": 0, "cpu_rows": 0, "calls": 0, "t_cpu_share": 0.0, "t_wait": 0.0, "t_npu": 0.0}
 
 
 def _quantize(w, group=None, rows=8192):
@@ -139,74 +144,45 @@ def _npu_thread_cpu():
 
 
 class _Job:
-    """One split call's NPU share: chunks launched in order, each dequantized by whoever gets it first.
+    """One split call's NPU share: chunks launched in order by the launch thread.
 
-    The launch thread marks a chunk ready when its launch returns. The helper
-    thread dequantizes ready chunks one at a time while the caller is still on
-    its own oneDNN share; once the caller is done with that, it takes the
-    remaining ready chunks itself, with all its OpenMP threads.
+    The caller dequantizes them once its own oneDNN share is done, with all its
+    OpenMP threads. (Dequantizing them meanwhile on a spare core was tried: its
+    72 MiB a chunk through the L3 slowed the caller's oneDNN share by ~35 %,
+    more than it saved.)
     """
-
-    READY, TAKEN, DONE = 1, 2, 3
 
     def __init__(self, gemm, R, rows, sx, out):
         self.gemm, self.sx, self.out = gemm, sx, out
         self.chunks = [(r0, min(r0 + rows, R)) for r0 in range(0, R, rows)]
-        self.state = [0] * len(self.chunks)
+        self.ready = 0  # chunks whose launch has returned
         self.cond = threading.Condition()
         self.error = None
         self.t_submit = time.perf_counter()
         self.t_last = None  # when the last launch returned
 
-    def _take(self):
-        """A ready chunk's index, now taken; None if there is none."""
-        for i, st in enumerate(self.state):
-            if st == self.READY:
-                self.state[i] = self.TAKEN
-                return i
-        return None
-
-    def _dequant(self, i, parallel):
-        r0, r1 = self.chunks[i]
-        self.gemm.dequant(r0, r1, self.sx[r0:r1], self.out[r0:r1], parallel)
-        with self.cond:
-            self.state[i] = self.DONE
-            self.cond.notify_all()
-
     def finish(self):
-        """The caller's part: dequantize what is left, wait for the rest."""
-        while True:
+        """The caller's part: dequantize each chunk as soon as its launch is in."""
+        for i, (r0, r1) in enumerate(self.chunks):
             with self.cond:
-                while True:
-                    if self.error is not None:
-                        raise RuntimeError("NPU GEMM failed") from self.error
-                    if all(st == self.DONE for st in self.state):
-                        return
-                    i = self._take()
-                    if i is not None:
-                        break
+                while self.ready <= i and self.error is None:
                     self.cond.wait()
-            self._dequant(i, parallel=True)
+                if self.error is not None:
+                    raise RuntimeError("NPU GEMM failed") from self.error
+            self.gemm.dequant(r0, r1, self.sx[r0:r1], self.out[r0:r1])
 
 
 class _NpuWorker:
-    """The NPU launch thread, and a helper thread that dequantizes finished chunks.
-
-    Both sit on a core no OpenMP thread uses (the launch thread mostly waits
-    on the NPU, so they share it).
-    """
+    """The NPU launch thread, on a core no OpenMP thread uses."""
 
     def __init__(self):
         self.jobs = queue.Queue()
-        self.ready = queue.Queue()
         cpu = _npu_thread_cpu()
-        threading.Thread(target=self._launch_loop, args=(cpu,), daemon=True, name="xdna-npu").start()
-        helper = min(_siblings(cpu)) if cpu is not None else None
-        threading.Thread(target=self._dequant_loop, args=(helper,), daemon=True, name="xdna-dequant").start()
+        threading.Thread(target=self._loop, args=(cpu,), daemon=True, name="xdna-npu").start()
         if cpu is not None:
-            logger.info("xdna_int8: NPU launch thread on CPU %d, dequant helper on CPU %d", cpu, helper)
+            logger.info("xdna_int8: NPU launch thread on CPU %d", cpu)
 
-    def _launch_loop(self, cpu):
+    def _loop(self, cpu):
         if cpu is not None:
             os.sched_setaffinity(0, {cpu})  # this thread only
         npu_runtime.use_npu()
@@ -216,25 +192,14 @@ class _NpuWorker:
                 for i, (r0, r1) in enumerate(job.chunks):
                     job.gemm.launch_rows(r0, r1 - r0)
                     with job.cond:
-                        job.state[i] = job.READY
-                        if i == len(job.chunks) - 1:
+                        job.ready = i + 1
+                        if job.ready == len(job.chunks):
                             job.t_last = time.perf_counter()
                         job.cond.notify_all()
-                    self.ready.put(job)
             except BaseException as e:  # hand the error to the caller
                 with job.cond:
                     job.error = e
                     job.cond.notify_all()
-
-    def _dequant_loop(self, cpu):
-        if cpu is not None:
-            os.sched_setaffinity(0, {cpu})
-        while True:
-            job = self.ready.get()
-            with job.cond:
-                i = job._take()
-            if i is not None:
-                job._dequant(i, parallel=False)
 
     def submit(self, gemm, R, sx, out):
         job = _Job(gemm, R, LAUNCH_ROWS if R >= LAUNCH_ROWS else npu.BLOCK_M, sx, out)
@@ -367,6 +332,8 @@ class Int8Linear:
     def npu_rows_for(self, M):
         if self.npu is None or M < NPU_MIN_ROWS or not NPU_ENABLED[0]:
             return 0
+        if FIXED_SHARE[0] is not None:
+            return min(int(M * FIXED_SHARE[0]) // npu.BLOCK_M * npu.BLOCK_M, npu.MAX_ROWS)
         return self._tuner(M).pick()
 
     def __call__(self, x):
@@ -396,6 +363,10 @@ class Int8Linear:
             self.cpu(x[R:], out[R:])
         t_cpu = time.perf_counter()
         job.finish()
+        t_end = time.perf_counter()
+        STATS["t_cpu_share"] += t_cpu - t0
+        STATS["t_wait"] += t_end - t_cpu
+        STATS["t_npu"] += (job.t_last or t_end) - job.t_submit
         tuner = self._tuner(M)
         tuner.record(R, time.perf_counter() - t0)
         if job.t_last is not None:
