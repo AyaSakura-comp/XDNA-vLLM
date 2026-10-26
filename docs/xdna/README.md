@@ -65,14 +65,22 @@ Memory is about 14.5 GB in all.
 **One split call** (`Int8Linear._run`), for M rows with R of them on the NPU:
 
 1. The main thread quantizes the R rows into the NPU's tiled staging buffer.
-2. The NPU launch thread launches them, 1024 rows at a time.
+2. The NPU launch thread launches them, 512 rows at a time. It sits on a core
+   no OpenMP thread uses.
 3. Meanwhile the main thread runs oneDNN on the other M − R rows.
-4. As each launch returns, a helper thread evicts its result rows from the
-   CPU caches and dequantizes them into the output (`cpu_ops.invalidate_dequant`).
-5. When the main thread finishes its oneDNN share, it takes any chunks still
-   waiting, using all its OpenMP threads.
+4. When its share is done, the main thread takes each NPU chunk as its launch
+   returns. It evicts the chunk's result rows from the CPU caches and
+   dequantizes them into the output, using all its OpenMP threads
+   (`cpu_ops.invalidate_dequant`).
 
-The launch thread and the helper sit on a core no OpenMP thread uses.
+Two variants measured worse in the full model, though neither shows in a
+single-GEMM benchmark:
+
+- **Dequantizing chunks on a spare core while oneDNN runs.** It streams
+  72 MiB a chunk through the L3 and slows oneDNN by ~35 %.
+- **1024-row launches.** A second grid per shape is a second kernel and
+  hardware context: 18 contexts for the model's 9 shapes, so they were
+  evicted and reopened, at ~35 ms each, during every prefill.
 
 **Split policy** (`_SplitTuner` in `quantization/xdna_int8.py`): the NPU's
 share is picked per (N, K, rows/512) by timing whole calls.
@@ -93,7 +101,7 @@ The environment variables:
 | `XDNA_VLLM_NPU_LAYERS` | regex of the linears that get an NPU copy (default `qkv_proj\|o_proj\|gate_up_proj\|down_proj\|per_layer_model_projection`) |
 | `XDNA_VLLM_NPU_MIN_ROWS` | default 1024 |
 | `XDNA_VLLM_NPU_ROWS` | the NPU's rows per call, at most (default 2048) |
-| `XDNA_VLLM_NPU_LAUNCH_ROWS` | rows per NPU launch (default 1024) |
+| `XDNA_VLLM_NPU_LAUNCH_ROWS` | rows per NPU launch (default 512; each distinct value is another compiled kernel and hardware context) |
 | `XDNA_VLLM_NPU_CPU` | the CPU for the launch thread; default: a core no OpenMP thread uses |
 | `XDNA_VLLM_CALIBRATE_ROWS` | the row counts to calibrate at load |
 | `XDNA_VLLM_TRACE=1` | log one line per linear call |
@@ -154,6 +162,42 @@ The environment variables:
 
 ## Results (Gemma 4 E2B, 2026-10-26)
 
+**CPU+NPU against CPU only.** These come from `benchmarks/xdna/ab_npu.py 6`:
+one process, with the NPU split switched on and off at run time. The two
+modes run back to back in each of 6 rounds, and the change is the median of
+the per-round ratios. Prefix caching is off.
+
+| | CPU only (xdna_int8) | CPU + NPU | change | rounds NPU faster |
+|---|---|---|---|---|
+| prefill B=1: one 3.6K-token prompt, TTFT | 1883 ms | **1626 ms** | **−14.1 %** | 6/6 |
+| prefill B=4: four 1.9K-token prompts, last first token | 3846 ms | **3293 ms** | **−14.2 %** | 6/6 |
+| decode B=1, per request | 30.2 tok/s | 30.5 tok/s | +1.2 % (noise; no NPU) | 4/6 |
+| decode B=4, per request (×4 in total) | 30.5 tok/s | 30.6 tok/s | +0.3 % (noise; no NPU) | 4/6 |
+
+This box is shared. Every A/B taken while other jobs loaded it (an iGPU
+LLM decoding, test runs, NPU jobs of other processes) was noisy enough that
+decode, which runs the same code in both modes, moved ±10 %. The table above
+was taken in a quiet window: decode agrees to 1 %.
+
+**Against vLLM's own CPU backend in bf16**, measured earlier the same day:
+
+| | vLLM bf16 | XDNA-vLLM, CPU + NPU |
+|---|---|---|
+| prefill B=1 | 2627 ms (3658 tokens) | 1626 ms (3626 tokens) |
+| prefill B=4 | 5650 ms (served) | 3293 ms (offline) |
+| decode B=1 | 18.5 tok/s | 30.5 tok/s |
+| decode B=4, per request | 18.9 tok/s | 30.6 tok/s |
+
+The two prefill B=4 numbers come from different harnesses: the bf16 one
+through the server, the XDNA-vLLM one offline.
+
+Perplexity (`benchmarks/xdna/ppl.py`, 4 × 2048 tokens): bf16 102.06,
+xdna_int8 with the NPU split 102.68.
+
+The tables below are from the first version (only the MLP on the NPU, 512-row
+launches, XRT syncs per launch). They are kept for the bf16 and long-prompt
+columns.
+
 TTFT for one request, with prefix caching off (`benchmarks/xdna/bench.py`, 4096-token chunks):
 
 | prompt tokens | vLLM bf16 | xdna_int8, CPU only | xdna_int8 + NPU |
@@ -176,8 +220,22 @@ Concurrent requests (`benchmarks/xdna/bench_batch.py`): B distinct
 | 16 | 24.7 / 402 | 16.7 / 265 |
 | 32 | 17.3 / 648 | 11.4 / 431 |
 
-Decode runs on the CPU only. Perplexity (`benchmarks/xdna/ppl.py`) is 102.06
-for bf16 and 103.40 for xdna_int8, 1.3 % higher.
+Decode runs on the CPU only. In that version perplexity was 103.40 for
+xdna_int8 (bf16: 102.06).
+
+## Next steps
+
+- **Attention on the NPU.** At 3.6K tokens attention is about 22 % of a
+  prefill (358 ms, 3.3 TFLOPS, 75 % of the CPU's bf16 peak). At 12K tokens
+  the seven full-attention layers dominate (8.3 TFLOP). Triton-XDNA's
+  `examples/llm_q4nx/attn_npu.py` runs Q·K^T and P·V on the NPU and leaves the
+  masked softmax to the host. Splitting heads between it and the CPU could
+  take about 7 % off a 3.6K prefill and about 15 % at 12K (estimated, not
+  measured). It needs the paged KV gathered, and Gemma's KV-shared layers
+  handled.
+- **Back end:** overlap each 512 × 512 block's C write-back with the next
+  block's loads in the matmul schedule. This is about half of a gate_up
+  launch.
 
 ## Changes against vLLM v0.32.0
 

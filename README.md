@@ -9,7 +9,18 @@ the NPU kernels are written in Triton and compiled by
 [Triton-XDNA](https://github.com/AyaSakura-comp/Triton-XDNA), which is
 included as the `third_party/triton-xdna` submodule.
 
-- [docs/xdna/README.md](docs/xdna/README.md): setup, design, and results.
+- [docs/xdna/README.md](docs/xdna/README.md): setup, design, results, and
+  the measured rooflines and limits.
+
+Gemma 4 E2B on a Ryzen AI Max+ 395. NPU+CPU is compared with CPU only in the
+same process, interleaved; bf16 is vLLM's own CPU backend.
+
+| | vLLM bf16 | XDNA-vLLM, CPU only | XDNA-vLLM, CPU + NPU |
+|---|---|---|---|
+| prefill, 1 × 3.6K tokens | 2627 ms | 1883 ms | **1626 ms** |
+| prefill, 4 × 1.9K tokens | 5650 ms | 3846 ms | **3293 ms** |
+| decode, 1 request | 18.5 tok/s | 30.2 tok/s | 30.5 tok/s |
+| decode, 4 requests (each) | 18.9 tok/s | 30.5 tok/s | 30.6 tok/s |
 - [docs/xdna/kernels.md](docs/xdna/kernels.md): kernel front ends go in vLLM
   (`vllm/kernels/xdna`), and the compiler and runtime they need go in Triton-XDNA.
 
