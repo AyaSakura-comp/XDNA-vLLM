@@ -136,7 +136,12 @@ def _npu_thread_cpu():
     """
     if os.environ.get("XDNA_VLLM_NPU_CPU"):
         return int(os.environ["XDNA_VLLM_NPU_CPU"])
-    omp = {int(c) for c in re.findall(r"\d+", os.environ.get("OMP_PLACES", ""))}
+    # vLLM's CPU worker binds its OpenMP threads through one of these,
+    # depending on the OpenMP runtime (Intel's is preloaded here).
+    kmp = re.search(r"proclist=\[([^\]]*)\]", os.environ.get("KMP_AFFINITY", ""))
+    spec = (kmp.group(1) if kmp else "") or os.environ.get("OMP_PLACES", "") or \
+        os.environ.get("GOMP_CPU_AFFINITY", "")
+    omp = {int(c) for c in re.findall(r"\d+", spec)}
     if not omp:
         return None
     free = [c for c in range(os.cpu_count() or 1) if not (_siblings(c) & omp)]
