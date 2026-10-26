@@ -26,6 +26,14 @@ The rule of thumb is whether a change is specific to one kernel:
    - Keep weights and long-lived buffers as resident tensors
      (`resident.to_npu(w, static=True)`, `resident.empty`). Launches on views
      of them copy nothing.
+   - Mark outputs `resident.set_device_writes(t, sync_back=False)` and read
+     them through `cpu_ops.invalidate_dequant` or `cpu_ops.invalidate`. The
+     NPU does not snoop the CPU caches, and XRT's own syncs are
+     single-threaded cache flushes on the launching thread.
+   - Lay operands out tile-contiguous where you can, so each DMA reads long
+     runs. Weights can be reordered once at load.
+   - Use one grid per shape: each grid is another compiled kernel and NPU
+     hardware context.
    - Launch from one thread that has called `runtime.use_npu()`. The active
      driver is per thread.
 2. Call it from vLLM through a layer method or a quantization method, or
@@ -44,7 +52,7 @@ them were int8 GEMMs.
 
 | kernel (original place) | now |
 |---|---|
-| `matmul_i8_k` and `NpuGemm`, `~/src/vllm-npu/xdna_vllm/npu.py` (the vLLM plugin) | `vllm/kernels/xdna/gemm_i8.py` |
+| `matmul_i8_k` and `NpuGemm`, `~/src/vllm-npu/xdna_vllm/npu.py` (the vLLM plugin) | `vllm/kernels/xdna/gemm_i8.py`, now `matmul_i8_tiled` (tile-contiguous A/B), with `cpu_ops.py` for the CPU side |
 | plugin's quantization method, `~/src/vllm-npu/xdna_vllm/quant.py` | `vllm/model_executor/layers/quantization/xdna_int8.py` |
 | `matmul_i8_k`, `~/src/gemma-npu/npu_kernels.py` (HF transformers pipeline) | same kernel as above; that pipeline is replaced by serving through vLLM |
 | `matmul_i8_k` copies in `~/src/omnivoice-npu/kbench.py` and `prof_npu.py` | same kernel; the GEMM benchmark is `benchmarks/xdna/bench_gemm.py` |
