@@ -1,4 +1,27 @@
 <!-- markdownlint-disable MD001 MD041 -->
+# XDNA-vLLM
+
+**vLLM on AMD Ryzen AI: the CPU platform plus Triton kernels for the XDNA2 NPU.**
+
+This fork of [vLLM](https://github.com/vllm-project/vllm) v0.32.0 runs LLMs on
+the CPU platform. The heavy prefill GEMMs are shared with the XDNA2 NPU, and
+the NPU kernels are written in Triton and compiled by
+[Triton-XDNA](https://github.com/AyaSakura-comp/Triton-XDNA), which is
+included as the `third_party/triton-xdna` submodule.
+
+- [docs/xdna/README.md](docs/xdna/README.md): setup, design, and results.
+- [docs/xdna/kernels.md](docs/xdna/kernels.md): kernel front ends go in vLLM
+  (`vllm/kernels/xdna`), and the compiler and runtime they need go in Triton-XDNA.
+
+```bash
+git clone --recursive git@github.com:AyaSakura-comp/XDNA-vLLM.git
+tools/xdna/link_venv.sh && tools/xdna/serve.sh   # Gemma 4 E2B, OpenAI API on :8013
+```
+
+The upstream vLLM README follows.
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
