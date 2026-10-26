@@ -37,6 +37,7 @@ QuantizationMethods = Literal[
     "gpt_oss_mxfp4",
     "deepseek_v4_fp8",
     "online",
+    "xdna_int8",
     # Below are online quant shorthand names (see vllm.config.quantization).
     # Listed here as strings to avoid a circular import; kept in sync with
     # _ONLINE_SHORTHANDS by the assertion in get_quantization_config().
@@ -152,6 +153,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .mxfp4 import GptOssMxfp4Config, Mxfp4Config
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
+    from .xdna_int8 import XdnaInt8Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "awq": AutoAWQConfig,
@@ -182,6 +184,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         # ModelOpt MXFP8 config (same format). The "mxfp8" online shorthand
         # below only applies to the `--quantization mxfp8` CLI path.
         "mxfp8": ModelOptMxFp8Config,
+        "xdna_int8": XdnaInt8Config,
     }
 
     # Register online shorthands (e.g. "fp8_per_tensor") as quant methods.
