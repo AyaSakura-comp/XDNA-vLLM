@@ -1,0 +1,4 @@
+[submodule "third_party/triton-xdna"]
+	path = third_party/triton-xdna
+	url = https://github.com/AyaSakura-comp/Triton-XDNA.git
+	branch = main
