@@ -48,18 +48,24 @@ from vllm.model_executor.utils import set_weight_attrs
 
 
 logger = init_logger(__name__)
+_QUANT = torch.ops._C.dynamic_scaled_int8_quant
+_ONEDNN_MM = torch.ops._C.onednn_scaled_mm
 
 USE_NPU = os.environ.get("XDNA_VLLM_NPU", "1") == "1"
 NPU_MIN_ROWS = int(os.environ.get("XDNA_VLLM_NPU_MIN_ROWS", "1024"))  # fewer rows: CPU only
-# The MLP's linears: the biggest GEMMs, and the NPU's best shapes.
-NPU_LAYERS = re.compile(os.environ.get("XDNA_VLLM_NPU_LAYERS", r"gate_up_proj|down_proj"))
+# The linears worth an NPU copy (each costs its int8 size again in host
+# memory): all but the per-layer-input ones, whose N or K is 256.
+NPU_LAYERS = re.compile(os.environ.get(
+    "XDNA_VLLM_NPU_LAYERS", r"qkv_proj|o_proj|gate_up_proj|down_proj|per_layer_model_projection"))
 _SKIP = ("vision", "audio", "embed_vision", "embed_audio")  # towers stay bf16
 
 TRACE = os.environ.get("XDNA_VLLM_TRACE", "0") == "1"  # one stderr line per call of >= 256 rows
 _LAYERS = []  # Int8Linear by key; the custom op takes the key
 _TUNERS = {}  # (N, K, M // 512) -> _SplitTuner
-# Prefill chunk sizes to time the NPU split for at load; by default the
-# scheduler's chunk (max_num_batched_tokens) and half of it.
+# Row counts to time the NPU split for at load; by default every multiple of
+# 512 from NPU_MIN_ROWS up to the scheduler's chunk (max_num_batched_tokens),
+# since the tuner keeps one split per M // 512 and a prefill's last chunk, or a
+# batch of prompts, can land in any of them.
 _CALIBRATE_ENV = os.environ.get("XDNA_VLLM_CALIBRATE_ROWS")
 STATS = {"npu_rows": 0, "cpu_rows": 0, "calls": 0}
 
@@ -91,12 +97,35 @@ def _calibrate_rows():
         return [int(m) for m in _CALIBRATE_ENV.split(",") if m]
     cfg = get_current_vllm_config_or_none()
     chunk = cfg.scheduler_config.max_num_batched_tokens if cfg is not None else 4096
-    return sorted({m for m in (chunk // 2, chunk) if m >= NPU_MIN_ROWS})
+    lo = -(-NPU_MIN_ROWS // npu.BLOCK_M) * npu.BLOCK_M
+    return list(range(lo, chunk + 1, npu.BLOCK_M))
 
 
-@torch.compile(dynamic=True)
-def _dequant(acc, sx, sw):
-    return (acc.float() * sx * sw[None]).to(torch.bfloat16)
+def _siblings(cpu):
+    try:
+        text = open(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list").read()
+    except OSError:
+        return {cpu}
+    out = set()
+    for part in text.strip().split(","):
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def _npu_thread_cpu():
+    """A CPU for the launching thread: XDNA_VLLM_NPU_CPU, else one whose core no OMP thread uses.
+
+    The thread is created by the OMP master, so it would inherit its CPU and
+    take turns with oneDNN's thread 0 there for every launch and sync.
+    """
+    if os.environ.get("XDNA_VLLM_NPU_CPU"):
+        return int(os.environ["XDNA_VLLM_NPU_CPU"])
+    omp = {int(c) for c in re.findall(r"\d+", os.environ.get("OMP_PLACES", ""))}
+    if not omp:
+        return None
+    free = [c for c in range(os.cpu_count() or 1) if not (_siblings(c) & omp)]
+    return free[-1] if free else None
 
 
 class _NpuWorker:
@@ -107,6 +136,10 @@ class _NpuWorker:
         threading.Thread(target=self._loop, daemon=True, name="xdna-npu").start()
 
     def _loop(self):
+        cpu = _npu_thread_cpu()
+        if cpu is not None:
+            os.sched_setaffinity(0, {cpu})  # this thread only
+            logger.info("xdna_int8: NPU launch thread on CPU %d", cpu)
         npu_runtime.use_npu()
         while True:
             gemm, R, done, times = self.jobs.get()
@@ -183,6 +216,7 @@ class Int8Linear:
         # not a copy, so they must live as long as the handle.
         self.w_scale = ws.float()[:, None].contiguous()
         self.dnnl = ops.create_onednn_scaled_mm(wq.t(), self.w_scale, torch.bfloat16, True, False, 32)
+        self.dnnl_handle = self.dnnl.handler_tensor
         self.npu = None
         if allow_npu and USE_NPU and self.K % npu.BLOCK_K == 0 and self.N >= npu.BLOCK_N:
             self.npu = npu.NpuGemm(wq, ws)
@@ -192,8 +226,16 @@ class Int8Linear:
             self._calibrate()
 
     def cpu(self, x, out):
-        xq, xs, _ = ops.onednn_scaled_int8_quant(x)
-        ops.onednn_scaled_mm(self.dnnl, xq, out, xs, None, None, None)
+        """oneDNN W8A8 on the CPU: x [M, K] contiguous -> out [M, N].
+
+        The ops are called directly: at decode every linear is a few rows, and
+        the _custom_ops wrappers' Python is a noticeable share of a token.
+        """
+        M = x.shape[0]
+        xq = torch.empty((M, self.K), dtype=torch.int8)
+        xs = torch.empty((M, 1), dtype=torch.float32)
+        _QUANT(xq, x, xs, None)
+        _ONEDNN_MM(out, xq, xs, None, None, None, self.dnnl_handle)
         return out
 
     def _tuner(self, M):
@@ -243,9 +285,7 @@ class Int8Linear:
                 self._tuner(M).record(0, time.perf_counter() - t0)
             return out, 0
         g = self.npu
-        a, c = g.stage(R)
-        sx = torch.empty((R, 1), dtype=torch.float32)
-        torch.ops._C.dynamic_scaled_int8_quant(a, x[:R], sx, None)
+        sx = g.quantize(x[:R])
         done, times = _WORKER.submit(g, R)
         if M > R:
             self.cpu(x[R:], out[R:])
@@ -254,7 +294,7 @@ class Int8Linear:
             if times and isinstance(times[-1], BaseException):
                 raise RuntimeError(f"NPU GEMM failed in {self.name}") from times[-1]
             r1 = r0 + npu.BLOCK_M
-            out[r0:r1] = _dequant(c[r0:r1, : self.N], sx[r0:r1], g.sw)
+            g.dequant(r0, r1, sx[r0:r1], out[r0:r1])
         self._tuner(M).record(R, time.perf_counter() - t0)
         STATS["npu_rows"] += R
         STATS["cpu_rows"] += M - R
@@ -263,9 +303,16 @@ class Int8Linear:
 
 @torch.library.custom_op("xdna::int8_linear", mutates_args=())
 def int8_linear(x: torch.Tensor, key: int) -> torch.Tensor:
+    lin = _LAYERS[key]
     shape = x.shape
-    y = _LAYERS[key](x.reshape(-1, shape[-1]).contiguous())
-    return y.view(*shape[:-1], y.shape[-1])
+    x2 = x.reshape(-1, shape[-1])
+    if not x2.is_contiguous():
+        x2 = x2.contiguous()
+    if x2.shape[0] < NPU_MIN_ROWS and not TRACE:  # decode, short prompts: straight to oneDNN
+        y = lin.cpu(x2, torch.empty((x2.shape[0], lin.N), dtype=torch.bfloat16))
+    else:
+        y = lin(x2)
+    return y.view(*shape[:-1], lin.N)
 
 
 @int8_linear.register_fake

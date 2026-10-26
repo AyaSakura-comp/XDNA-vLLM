@@ -28,8 +28,15 @@ def init() -> dict:
             return _state
         import triton
         import triton.language as tl
-        from triton.backends.amd_triton_npu import resident
+        from triton.backends.amd_triton_npu import driver, resident
         from triton.backends.amd_triton_npu.driver import NPUDriver
+
+        # One hardware context per compiled kernel (per GEMM shape). A model
+        # has ~10 shapes, and past the backend's default of 8 a launch evicts
+        # and rebuilds one (~35 ms). The driver reads the variable when vLLM
+        # first imports Triton, long before this, so set its value directly.
+        if "AMD_TRITON_NPU_XRT_MAX_SESSIONS" not in os.environ:
+            driver._MAX_LIVE_SESSIONS = max(driver._MAX_LIVE_SESSIONS, 16)
 
         os.makedirs(CACHE, exist_ok=True)
         # Intermediate IR goes here, not into whatever the server's cwd is.
